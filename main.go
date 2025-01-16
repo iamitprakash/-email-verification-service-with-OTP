@@ -1,17 +1,17 @@
 package main
 
 import (
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/gofiber/fiber/v2"
 	"github.com/joho/godotenv"
 	"gopkg.in/gomail.v2"
+	_ "github.com/denisenkom/go-mssqldb"
 )
 
 // Constants
@@ -24,6 +24,7 @@ const (
 
 // Types
 type OTPRecord struct {
+	ID        int64     `json:"id"`
 	Email     string    `json:"email"`
 	OTP       string    `json:"otp"`
 	CreatedAt time.Time `json:"created_at"`
@@ -35,11 +36,26 @@ type EmailService interface {
 	SendEmail(to, subject, body string) error
 }
 
-type RedisService interface {
+type DBService interface {
 	StoreOTP(record OTPRecord) error
 	GetOTP(email string) (*OTPRecord, error)
-	DeleteOTP(email string) error
+	UpdateOTP(record OTPRecord) error
+	CleanupExpiredOTPs() error
 }
+
+// Database schema setup
+const schemaSQL = `
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='otp_verifications' and xtype='U')
+CREATE TABLE otp_verifications (
+    id BIGINT IDENTITY(1,1) PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    otp VARCHAR(10) NOT NULL,
+    created_at DATETIME NOT NULL,
+    attempts INT DEFAULT 0,
+    verified BIT DEFAULT 0,
+    CONSTRAINT UC_Email UNIQUE (email)
+)
+`
 
 // Email Service Implementation
 type SMTPEmailService struct {
@@ -49,11 +65,10 @@ type SMTPEmailService struct {
 func NewSMTPEmailService() *SMTPEmailService {
 	dialer := gomail.NewDialer(
 		os.Getenv("SMTP_HOST"),
-		587, // default SMTP port
+		587,
 		os.Getenv("SMTP_USER"),
 		os.Getenv("SMTP_PASS"),
 	)
-	
 	return &SMTPEmailService{dialer: dialer}
 }
 
@@ -63,63 +78,125 @@ func (s *SMTPEmailService) SendEmail(to, subject, body string) error {
 	m.SetHeader("To", to)
 	m.SetHeader("Subject", subject)
 	m.SetBody("text/html", body)
-
 	return s.dialer.DialAndSend(m)
 }
 
-// Redis Service Implementation
-type RedisOTPService struct {
-	client *redis.Client
+// SQL Server Implementation
+type SQLServerService struct {
+	db *sql.DB
 }
 
-func NewRedisOTPService() *RedisOTPService {
-	client := redis.NewClient(&redis.Options{
-		Addr: os.Getenv("REDIS_URL"),
-	})
-	
-	return &RedisOTPService{client: client}
-}
+func NewSQLServerService() (*SQLServerService, error) {
+	connString := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s;database=%s",
+		os.Getenv("DB_SERVER"),
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_PORT"),
+		os.Getenv("DB_NAME"),
+	)
 
-func (s *RedisOTPService) StoreOTP(record OTPRecord) error {
-	data, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-
-	key := fmt.Sprintf("email_verification:%s", record.Email)
-	return s.client.Set(s.client.Context(), key, string(data), time.Minute*OTPExpiryMinutes).Err()
-}
-
-func (s *RedisOTPService) GetOTP(email string) (*OTPRecord, error) {
-	key := fmt.Sprintf("email_verification:%s", email)
-	data, err := s.client.Get(s.client.Context(), key).Result()
+	db, err := sql.Open("mssql", connString)
 	if err != nil {
 		return nil, err
 	}
 
+	// Create schema if not exists
+	if _, err := db.Exec(schemaSQL); err != nil {
+		return nil, err
+	}
+
+	return &SQLServerService{db: db}, nil
+}
+
+func (s *SQLServerService) StoreOTP(record OTPRecord) error {
+	query := `
+		MERGE INTO otp_verifications WITH (HOLDLOCK) AS target
+		USING (SELECT @Email AS email) AS source
+		ON target.email = source.email
+		WHEN MATCHED THEN
+			UPDATE SET 
+				otp = @OTP,
+				created_at = @CreatedAt,
+				attempts = @Attempts,
+				verified = @Verified
+		WHEN NOT MATCHED THEN
+			INSERT (email, otp, created_at, attempts, verified)
+			VALUES (@Email, @OTP, @CreatedAt, @Attempts, @Verified);
+	`
+
+	_, err := s.db.Exec(query,
+		sql.Named("Email", record.Email),
+		sql.Named("OTP", record.OTP),
+		sql.Named("CreatedAt", record.CreatedAt),
+		sql.Named("Attempts", record.Attempts),
+		sql.Named("Verified", record.Verified),
+	)
+	return err
+}
+
+func (s *SQLServerService) GetOTP(email string) (*OTPRecord, error) {
+	query := `
+		SELECT id, email, otp, created_at, attempts, verified 
+		FROM otp_verifications 
+		WHERE email = @Email
+	`
+
 	var record OTPRecord
-	if err := json.Unmarshal([]byte(data), &record); err != nil {
+	err := s.db.QueryRow(query, sql.Named("Email", email)).Scan(
+		&record.ID,
+		&record.Email,
+		&record.OTP,
+		&record.CreatedAt,
+		&record.Attempts,
+		&record.Verified,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, err
 	}
 
 	return &record, nil
 }
 
-func (s *RedisOTPService) DeleteOTP(email string) error {
-	key := fmt.Sprintf("email_verification:%s", email)
-	return s.client.Del(s.client.Context(), key).Err()
+func (s *SQLServerService) UpdateOTP(record OTPRecord) error {
+	query := `
+		UPDATE otp_verifications 
+		SET attempts = @Attempts, verified = @Verified 
+		WHERE email = @Email
+	`
+
+	_, err := s.db.Exec(query,
+		sql.Named("Attempts", record.Attempts),
+		sql.Named("Verified", record.Verified),
+		sql.Named("Email", record.Email),
+	)
+	return err
+}
+
+func (s *SQLServerService) CleanupExpiredOTPs() error {
+	query := `
+		DELETE FROM otp_verifications 
+		WHERE created_at < DATEADD(MINUTE, -@ExpiryMinutes, GETDATE())
+		AND verified = 0
+	`
+
+	_, err := s.db.Exec(query, sql.Named("ExpiryMinutes", OTPExpiryMinutes))
+	return err
 }
 
 // Verification Service
 type VerificationService struct {
 	emailService EmailService
-	redisService RedisService
+	dbService    DBService
 }
 
-func NewVerificationService(emailService EmailService, redisService RedisService) *VerificationService {
+func NewVerificationService(emailService EmailService, dbService DBService) *VerificationService {
 	return &VerificationService{
 		emailService: emailService,
-		redisService: redisService,
+		dbService:    dbService,
 	}
 }
 
@@ -147,9 +224,16 @@ func getOTPEmailTemplate(otp string) string {
 }
 
 func (s *VerificationService) SendVerificationEmail(email string) error {
+	// Cleanup expired OTPs
+	s.dbService.CleanupExpiredOTPs()
+
 	// Check for existing OTP
-	existingRecord, err := s.redisService.GetOTP(email)
-	if err == nil && existingRecord != nil {
+	existingRecord, err := s.dbService.GetOTP(email)
+	if err != nil {
+		return err
+	}
+
+	if existingRecord != nil {
 		timeSinceLastOTP := time.Since(existingRecord.CreatedAt).Minutes()
 		if timeSinceLastOTP < ResendDelayMins {
 			return fmt.Errorf("please wait %d minutes before requesting a new OTP", ResendDelayMins)
@@ -167,26 +251,25 @@ func (s *VerificationService) SendVerificationEmail(email string) error {
 	}
 
 	// Store OTP
-	if err := s.redisService.StoreOTP(record); err != nil {
+	if err := s.dbService.StoreOTP(record); err != nil {
 		return err
 	}
 
 	// Send email
-	if err := s.emailService.SendEmail(
+	return s.emailService.SendEmail(
 		email,
 		"Email Verification Code",
 		getOTPEmailTemplate(otp),
-	); err != nil {
-		s.redisService.DeleteOTP(email)
-		return err
-	}
-
-	return nil
+	)
 }
 
 func (s *VerificationService) VerifyOTP(email, providedOTP string) error {
-	record, err := s.redisService.GetOTP(email)
+	record, err := s.dbService.GetOTP(email)
 	if err != nil {
+		return err
+	}
+
+	if record == nil {
 		return fmt.Errorf("no verification code found or code has expired")
 	}
 
@@ -195,32 +278,38 @@ func (s *VerificationService) VerifyOTP(email, providedOTP string) error {
 	}
 
 	if record.Attempts >= MaxAttempts {
-		s.redisService.DeleteOTP(email)
 		return fmt.Errorf("maximum verification attempts exceeded")
 	}
 
 	record.Attempts++
 
 	if record.OTP != providedOTP {
-		s.redisService.StoreOTP(*record)
+		if err := s.dbService.UpdateOTP(*record); err != nil {
+			return err
+		}
 		return fmt.Errorf("invalid verification code")
 	}
 
 	record.Verified = true
-	return s.redisService.StoreOTP(*record)
+	return s.dbService.UpdateOTP(*record)
 }
 
-// HTTP Handlers
+// HTTP Server Setup
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file")
 	}
 
-	app := fiber.New()
-
+	// Initialize services
 	emailService := NewSMTPEmailService()
-	redisService := NewRedisOTPService()
-	verificationService := NewVerificationService(emailService, redisService)
+	dbService, err := NewSQLServerService()
+	if err != nil {
+		log.Fatal("Failed to initialize database:", err)
+	}
+
+	verificationService := NewVerificationService(emailService, dbService)
+
+	app := fiber.New()
 
 	app.Post("/send-otp", func(c *fiber.Ctx) error {
 		var body struct {
